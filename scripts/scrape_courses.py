@@ -233,16 +233,25 @@ class NJUCourseClient:
         self.timeout_seconds = timeout_seconds
         self.max_attempts = max_attempts
         self.session = session or requests.Session()
+        self.debug = os.getenv("NJU_DEBUG") == "1"
         self._last_request_at: float | None = None
 
         self.session.headers.update(
             {
                 "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": "https://ehallapp.nju.edu.cn",
                 "Referer": APP_ENTRY_URL,
+                "Sec-CH-UA": (
+                    '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'
+                ),
+                "Sec-CH-UA-Mobile": "?0",
+                "Sec-CH-UA-Platform": '"macOS"',
                 "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/136.0 Safari/537.36"
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/149.0.0.0 Safari/537.36"
                 ),
                 "X-Requested-With": "XMLHttpRequest",
             }
@@ -255,6 +264,25 @@ class NJUCourseClient:
             secure=True,
         )
 
+    @staticmethod
+    def _safe_url(url: str) -> str:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    def _debug_session(self, response: requests.Response) -> None:
+        if not self.debug:
+            return
+        chain = [*response.history, response]
+        summary = " -> ".join(
+            f"{item.status_code} {self._safe_url(str(item.url))}" for item in chain
+        )
+        cookies = sorted(
+            f"{cookie.name}@{cookie.domain}{cookie.path}"
+            for cookie in self.session.cookies
+        )
+        print(f"Authentication redirects: {summary}", flush=True)
+        print(f"Session cookie names: {', '.join(cookies) or '(none)'}", flush=True)
+
     def authenticate(self) -> None:
         try:
             response = self.session.get(
@@ -262,6 +290,7 @@ class NJUCourseClient:
                 allow_redirects=True,
                 timeout=self.timeout_seconds,
             )
+            self._debug_session(response)
             response.raise_for_status()
         except requests.RequestException as exc:
             raise ScrapeError("Failed to open the NJU course application") from exc
@@ -301,6 +330,15 @@ class NJUCourseClient:
                     allow_redirects=True,
                 )
                 self._last_request_at = time.monotonic()
+
+                if self.debug:
+                    print(
+                        "Course response: "
+                        f"HTTP {response.status_code} "
+                        f"{self._safe_url(str(response.url))}; "
+                        f"content-type={response.headers.get('content-type', '(missing)')}",
+                        flush=True,
+                    )
 
                 if response.status_code == 429 or response.status_code >= 500:
                     raise requests.HTTPError(
