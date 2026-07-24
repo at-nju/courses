@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from scripts.scrape_courses import (
     scrape_semester,
     select_work,
     semester_display,
+    write_course_exports,
 )
 
 
@@ -192,12 +194,40 @@ def test_scrape_semester_writes_pages_and_removes_stale_pages(tmp_path: Path) ->
     assert not (tmp_path / semester / "page_002.json").exists()
 
 
+def test_scrape_semester_writes_csv_and_deterministic_gzip(tmp_path: Path) -> None:
+    semester = "2026-2027-1"
+    rows = [
+        {
+            "KCH": "001",
+            "KCM": '课程, "A"',
+            "BZ": "第一行\n第二行",
+            "RS": None,
+        }
+    ]
+    page = PageData(raw=b"raw-json", rows=rows)
+
+    result = scrape_semester(FakeClient({}), tmp_path, semester, page)
+
+    expected = ('KCH,KCM,BZ,RS\n001,"课程, ""A""","第一行\n第二行",\n').encode()
+    semester_dir = tmp_path / semester
+    csv_bytes = (semester_dir / "courses.csv").read_bytes()
+    gzip_bytes = (semester_dir / "courses.csv.gz").read_bytes()
+    assert result.rows == 1
+    assert csv_bytes == expected
+    assert gzip.decompress(gzip_bytes) == expected
+
+    second_dir = tmp_path / "second"
+    scrape_semester(FakeClient({}), second_dir, semester, page)
+    assert (second_dir / semester / "courses.csv.gz").read_bytes() == gzip_bytes
+
+
 def test_scrape_semester_reports_unchanged_directory(tmp_path: Path) -> None:
     semester = "2026-2027-1"
     raw = b'{"datas":{"qxfbkccx":{"rows":[{"KCH":"001"}]}}}'
     destination = tmp_path / semester
     destination.mkdir()
     (destination / "page_001.json").write_bytes(raw)
+    write_course_exports(destination, [{"KCH": "001"}])
 
     result = scrape_semester(
         FakeClient({}),
@@ -225,12 +255,33 @@ def test_scrape_semester_preserves_empty_first_page(tmp_path: Path) -> None:
     assert result.rows == 0
     assert result.changed is True
     assert (tmp_path / semester / "page_001.json").read_bytes() == raw
+    assert not (tmp_path / semester / "courses.csv").exists()
+    assert not (tmp_path / semester / "courses.csv.gz").exists()
+
+
+def test_scrape_semester_rejects_inconsistent_fields_without_replacing_old_data(
+    tmp_path: Path,
+) -> None:
+    semester = "2026-2027-1"
+    destination = tmp_path / semester
+    destination.mkdir()
+    (destination / "sentinel").write_text("old")
+    page = PageData(
+        raw=b"raw-json",
+        rows=[{"KCH": "001", "KCM": "A"}, {"KCH": "002"}],
+    )
+
+    with pytest.raises(ResponseFormatError, match="inconsistent fields"):
+        scrape_semester(FakeClient({}), tmp_path, semester, page)
+
+    assert (destination / "sentinel").read_text() == "old"
+    assert not list((tmp_path / ".staging").glob(f"{semester}-*"))
 
 
 def test_scrape_semester_fetches_until_short_page(tmp_path: Path) -> None:
     semester = "2026-2027-1"
-    first = PageData(raw=b"first", rows=[{}] * 500)
-    second = PageData(raw=b"second", rows=[{}])
+    first = PageData(raw=b"first", rows=[{"KCH": "001"}] * 500)
+    second = PageData(raw=b"second", rows=[{"KCH": "002"}])
     client = FakeClient({(semester, 2): second})
 
     result = scrape_semester(client, tmp_path, semester, first)

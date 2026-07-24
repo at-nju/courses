@@ -1,1 +1,3 @@
 data/**/*.json linguist-generated=true
+data/**/*.csv linguist-generated=true
+data/**/*.csv.gz linguist-generated=true

@@ -2,7 +2,13 @@
 
 南京大学全校课程查询接口的非官方公开镜像。
 
-仓库通过 GitHub Actions 定期访问学校课程查询系统，并将接口返回的分页 JSON **原样**保存到 `data/`。脚本不清洗字段、不重命名字段、不合并页面，也不生成其他格式。
+仓库通过 GitHub Actions 定期访问学校课程查询系统，并为每个学期保存：
+
+- 教务接口返回的原始分页 JSON；
+- 合并全部课程记录后的 `courses.csv`；
+- 便于下载和传输的 `courses.csv.gz`。
+
+原始分页 JSON 是权威数据。CSV 和 gzip 是从同一次抓取结果生成的派生文件。
 
 > 本项目与南京大学官方无隶属或授权关系。数据可能延迟、缺失或发生变化，请以学校官方系统为准。
 
@@ -18,22 +24,32 @@ GitHub Actions 的 cron 使用 UTC；实际执行可能因 GitHub 调度而略�
 
 ```text
 data/
-├── 2025-2026-2/
+├── 2020-2021-3/
+│   └── page_001.json
+├── 2025-2026-3/
 │   ├── page_001.json
-│   ├── page_002.json
-│   └── ...
+│   ├── courses.csv
+│   └── courses.csv.gz
 └── 2026-2027-1/
     ├── page_001.json
     ├── page_002.json
-    └── ...
+    ├── ...
+    ├── courses.csv
+    └── courses.csv.gz
 ```
 
-每个文件都是对应分页请求的完整响应正文。文件名中的页码从 1 开始，单页请求大小为 500 条。
+`page_XXX.json` 是对应分页请求的完整响应正文。页码从 1 开始，单页请求大小为 500 条。
+
+`courses.csv` 按页码和接口原始记录顺序合并 `datas.qxfbkccx.rows`。表头沿用第一条课程记录的字段顺序，CSV 使用 UTF-8、无 BOM、LF 换行，并由 Python 标准库 `csv.DictWriter` 负责转义和标量值转换。
+
+`courses.csv.gz` 是 `courses.csv` 的确定性 gzip 压缩版本。压缩头不保存原文件名，`mtime` 固定为 0，因此相同 CSV 会生成相同的 gzip 字节。
+
+官方存在但课程接口返回空数据的学期只保存 `page_001.json`，不生成空 CSV。
 
 可以直接通过 GitHub 或 `raw.githubusercontent.com` 下载文件。例如：
 
 ```text
-https://raw.githubusercontent.com/at-nju/courses/main/data/2026-2027-1/page_001.json
+https://raw.githubusercontent.com/at-nju/courses/main/data/2026-2027-1/courses.csv.gz
 ```
 
 ## 自动任务
@@ -78,7 +94,7 @@ export NJU_CASTGC='your-castgc-value'
 python scripts/scrape_courses.py --latest 2
 ```
 
-刷新所有可探测到的学期：
+刷新所有官方学期：
 
 ```bash
 python scripts/scrape_courses.py --all
@@ -116,12 +132,13 @@ python -m pytest
 2. 打开课程应用入口，让 CAS 自动签发 service ticket 并建立 eHall 会话。
 3. 按网页启动流程加载应用权限配置，并初始化教务角色。
 4. 从课程模块元数据中找到 `XNXQDM` 代码表，并读取学校公布的真实学期列表，包括暑期等特殊学期。
-5. 按学期和页码顺序请求全校课程接口。
-6. 在 `data/.staging/` 中完成整个学期的下载。
-7. 全部页面成功后才替换正式学期目录。
-8. Git 判断文件是否变化；无变化时不提交。
+5. 按学期和页码顺序请求全校课程接口，并将原始响应写入 staging 目录。
+6. 对非空学期使用 Python 标准库生成 `courses.csv` 和确定性的 `courses.csv.gz`。
+7. 验证所有课程记录字段一致，且 gzip 解压结果与 CSV 逐字节相同。
+8. 整个学期成功后才原子替换正式目录。
+9. Git 判断文件是否变化；无变化时不提交。
 
-如果登录失效、返回 HTML、JSON 结构异常或网络请求最终失败，脚本会以非零状态退出，正式数据目录不会被半成品替换。
+如果登录失效、返回 HTML、JSON 结构异常、课程字段不一致或网络请求最终失败，脚本会以非零状态退出，正式数据目录不会被半成品替换。
 
 ## License
 

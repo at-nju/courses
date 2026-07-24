@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
 import json
 import os
 import re
@@ -556,6 +558,61 @@ def publish_staging_directory(staging: Path, destination: Path) -> bool:
     return True
 
 
+def write_course_exports(staging: Path, rows: list[Any]) -> None:
+    """Write deterministic CSV and gzip exports for one non-empty semester."""
+    if not rows:
+        return
+
+    first_row = rows[0]
+    if not isinstance(first_row, dict) or not first_row:
+        raise ResponseFormatError("Course rows must be non-empty objects")
+
+    fieldnames = list(first_row)
+    if any(not isinstance(field, str) for field in fieldnames):
+        raise ResponseFormatError("Course row field names must be strings")
+    expected_fields = set(fieldnames)
+
+    for row_number, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise ResponseFormatError(f"Course row {row_number} is not an object")
+        actual_fields = set(row)
+        if actual_fields != expected_fields:
+            missing = sorted(expected_fields - actual_fields)
+            extra = sorted(actual_fields - expected_fields)
+            raise ResponseFormatError(
+                f"Course row {row_number} has inconsistent fields; "
+                f"missing={missing}, extra={extra}"
+            )
+
+    csv_path = staging / "courses.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as output:
+        writer = csv.DictWriter(
+            output,
+            fieldnames=fieldnames,
+            extrasaction="raise",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    gzip_path = staging / "courses.csv.gz"
+    with (
+        csv_path.open("rb") as source,
+        gzip_path.open("wb") as compressed_file,
+        gzip.GzipFile(
+            filename="",
+            mode="wb",
+            fileobj=compressed_file,
+            mtime=0,
+        ) as target,
+    ):
+        shutil.copyfileobj(source, target)
+
+    csv_bytes = csv_path.read_bytes()
+    if gzip.decompress(gzip_path.read_bytes()) != csv_bytes:
+        raise ScrapeError("Generated courses.csv.gz does not match courses.csv")
+
+
 def scrape_semester(
     client: NJUCourseClient,
     data_dir: Path,
@@ -570,6 +627,7 @@ def scrape_semester(
     page_number = 1
     page_count = 0
     row_count = 0
+    all_rows: list[Any] = []
 
     try:
         while True:
@@ -588,11 +646,13 @@ def scrape_semester(
             (staging / f"page_{page_number:03d}.json").write_bytes(page_data.raw)
             page_count += 1
             row_count += len(page_data.rows)
+            all_rows.extend(page_data.rows)
 
             if len(page_data.rows) < PAGE_SIZE:
                 break
             page_number += 1
 
+        write_course_exports(staging, all_rows)
         changed = publish_staging_directory(staging, data_dir / semester)
         return SemesterResult(
             semester=semester,
