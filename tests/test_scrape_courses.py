@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
 from pathlib import Path
 
 import pytest
@@ -16,11 +15,12 @@ from scripts.scrape_courses import (
     NJUCourseClient,
     PageData,
     ResponseFormatError,
-    candidate_semesters,
     extract_castgc,
     make_query_setting,
     parse_course_response,
     parse_init_config,
+    parse_semester_code_url,
+    parse_semester_list,
     scrape_semester,
     select_work,
     semester_display,
@@ -28,9 +28,17 @@ from scripts.scrape_courses import (
 
 
 class FakeClient:
-    def __init__(self, pages: dict[tuple[str, int], PageData]) -> None:
+    def __init__(
+        self,
+        pages: dict[tuple[str, int], PageData],
+        semesters: dict[str, str] | None = None,
+    ) -> None:
         self.pages = pages
+        self.semesters = semesters or {}
         self.calls: list[tuple[str, int]] = []
+
+    def list_semesters(self) -> dict[str, str]:
+        return self.semesters
 
     def fetch_page(self, semester: str, page: int) -> PageData:
         self.calls.append((semester, page))
@@ -58,12 +66,7 @@ def test_extract_castgc_accepts_bare_and_cookie_header() -> None:
 
 def test_semester_helpers() -> None:
     assert semester_display("2026-2027-1") == "2026-2027学年 第1学期"
-    assert candidate_semesters(2025, 2026, (2, 1)) == [
-        "2025-2026-1",
-        "2025-2026-2",
-        "2026-2027-1",
-        "2026-2027-2",
-    ]
+    assert semester_display("2025-2026-3") == "2025-2026学年 暑期"
 
 
 def test_query_setting_contains_requested_semester() -> None:
@@ -78,6 +81,40 @@ def test_parse_init_config_extracts_app_and_role() -> None:
         '{"appname":"kcbcx","appId":"123","ROLEID":null};</script>'
     )
     assert parse_init_config(html) == ("kcbcx", "123", "")
+
+
+def test_parse_semester_discovery_metadata() -> None:
+    model_payload = {
+        "models": [
+            {
+                "name": "qxfbkccx",
+                "controls": [
+                    {
+                        "name": "XNXQDM",
+                        "url": "/jwapp/code/semester-list.do",
+                    }
+                ],
+            }
+        ]
+    }
+    assert parse_semester_code_url(model_payload) == (
+        "https://ehallapp.nju.edu.cn/jwapp/code/semester-list.do"
+    )
+
+    list_payload = {
+        "datas": {
+            "code": {
+                "rows": [
+                    {"id": "2025-2026-3", "name": "2025-2026学年 暑期"},
+                    {"id": "2025-2026-2", "name": "2025-2026学年 第2学期"},
+                ]
+            }
+        }
+    }
+    assert parse_semester_list(list_payload) == {
+        "2025-2026-3": "2025-2026学年 暑期",
+        "2025-2026-2": "2025-2026学年 第2学期",
+    }
 
 
 def test_authenticate_initializes_app_permissions() -> None:
@@ -188,24 +225,55 @@ def test_scrape_semester_fetches_until_short_page(tmp_path: Path) -> None:
     assert (tmp_path / semester / "page_002.json").read_bytes() == b"second"
 
 
-def test_select_latest_uses_only_recent_probe_window() -> None:
-    latest = {
-        ("2025-2026-2", 1): PageData(raw=b"a", rows=[{}]),
-        ("2026-2027-1", 1): PageData(raw=b"b", rows=[{}]),
+def test_select_latest_uses_authoritative_order_and_stops_after_count() -> None:
+    semesters = {
+        "2026-2027-1": "2026-2027学年 第1学期",
+        "2025-2026-3": "2025-2026学年 暑期",
+        "2025-2026-2": "2025-2026学年 第2学期",
     }
-    client = FakeClient(latest)
+    latest = {
+        ("2026-2027-1", 1): PageData(raw=b"b", rows=[{}]),
+        ("2025-2026-3", 1): PageData(raw=b"a", rows=[{}]),
+        ("2025-2026-2", 1): PageData(raw=b"old", rows=[{}]),
+    }
+    client = FakeClient(latest, semesters)
     args = argparse.Namespace(
         semesters=None,
         all=False,
         latest=2,
         start_year=2000,
         end_year=None,
-        terms=(1, 2),
     )
 
-    selected = select_work(args, client, today=date(2026, 7, 24))
+    selected = select_work(args, client)
 
-    assert list(selected) == ["2025-2026-2", "2026-2027-1"]
-    probed_years = {int(semester[:4]) for semester, _ in client.calls}
-    assert min(probed_years) == 2024
-    assert max(probed_years) == 2027
+    assert list(selected) == ["2025-2026-3", "2026-2027-1"]
+    assert client.calls == [("2026-2027-1", 1), ("2025-2026-3", 1)]
+
+
+def test_select_all_uses_authoritative_semester_list_including_summer() -> None:
+    semesters = {
+        "2025-2026-3": "2025-2026学年 暑期",
+        "2025-2026-2": "2025-2026学年 第2学期",
+        "2025-2026-1": "2025-2026学年 第1学期",
+    }
+    pages = {
+        (semester, 1): PageData(raw=semester.encode(), rows=[{"XNXQDM": semester}])
+        for semester in semesters
+    }
+    client = FakeClient(pages, semesters)
+    args = argparse.Namespace(
+        semesters=None,
+        all=True,
+        latest=None,
+        start_year=2025,
+        end_year=2025,
+    )
+
+    selected = select_work(args, client)
+
+    assert list(selected) == [
+        "2025-2026-1",
+        "2025-2026-2",
+        "2025-2026-3",
+    ]

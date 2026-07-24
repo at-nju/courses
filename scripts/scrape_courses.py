@@ -11,13 +11,11 @@ import shutil
 import sys
 import time
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -29,10 +27,12 @@ APP_CONFIG_URL_TEMPLATE = (
 SET_COMMON_ROLE_URL = (
     "https://ehallapp.nju.edu.cn/jwapp/sys/jwpubapp/pub/setJwCommonAppRole.do"
 )
+COURSE_MODEL_URL = (
+    "https://ehallapp.nju.edu.cn/jwapp/sys/kcbcx/modules/qxkcb.do?*json=1"
+)
 COURSE_API_URL = "https://ehallapp.nju.edu.cn/jwapp/sys/kcbcx/modules/qxkcb/qxfbkccx.do"
 PAGE_SIZE = 500
 DEFAULT_START_YEAR = 2000
-DEFAULT_TERMS = (1, 2)
 SEMESTER_PATTERN = re.compile(r"^(\d{4})-(\d{4})-(\d+)$")
 INIT_CONFIG_PATTERN = re.compile(
     r"window\._JW_INIT_CONFIG\s*=\s*(\{.*?\});",
@@ -91,6 +91,8 @@ def semester_display(semester: str) -> str:
     if not match:
         raise ValueError(f"Invalid semester code: {semester}")
     start, end, term = match.groups()
+    if term == "3":
+        return f"{start}-{end}学年 暑期"
     return f"{start}-{end}学年 第{term}学期"
 
 
@@ -101,29 +103,7 @@ def semester_sort_key(semester: str) -> tuple[int, int, int]:
     return tuple(int(item) for item in match.groups())
 
 
-def current_academic_start_year(today: date | None = None) -> int:
-    current = today or datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    return current.year if current.month >= 7 else current.year - 1
-
-
-def candidate_semesters(
-    start_year: int,
-    end_year: int,
-    terms: Sequence[int] = DEFAULT_TERMS,
-) -> list[str]:
-    if start_year > end_year:
-        raise ValueError("start_year must not be greater than end_year")
-    if not terms or any(term < 1 for term in terms):
-        raise ValueError("terms must contain positive integers")
-
-    return [
-        f"{year}-{year + 1}-{term}"
-        for year in range(start_year, end_year + 1)
-        for term in sorted(set(terms))
-    ]
-
-
-def make_query_setting(semester: str) -> str:
+def make_query_setting(semester: str, display_name: str | None = None) -> str:
     setting = [
         {
             "name": "XNXQDM",
@@ -132,7 +112,7 @@ def make_query_setting(semester: str) -> str:
             "builderList": "cbl_m_List",
             "builder": "m_value_equal",
             "value": semester,
-            "value_display": semester_display(semester),
+            "value_display": display_name or semester_display(semester),
         },
         [
             [
@@ -186,6 +166,69 @@ def parse_init_config(html: str) -> tuple[str, str, str]:
         raise ResponseFormatError("Course application config lacks appId")
 
     return appname, str(appid), "" if role is None else str(role)
+
+
+def parse_semester_code_url(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        raise ResponseFormatError("Course module metadata is not an object")
+
+    models = payload.get("models")
+    if not isinstance(models, list):
+        raise ResponseFormatError("Course module metadata lacks models")
+
+    preferred_models = [
+        model
+        for model in models
+        if isinstance(model, dict) and model.get("name") == "qxfbkccx"
+    ]
+    other_models = [
+        model
+        for model in models
+        if isinstance(model, dict) and model not in preferred_models
+    ]
+    candidates = preferred_models + other_models
+    for model in candidates:
+        controls = model.get("controls")
+        if not isinstance(controls, list):
+            continue
+        for control in controls:
+            if not isinstance(control, dict) or control.get("name") != "XNXQDM":
+                continue
+            code_url = control.get("url")
+            if isinstance(code_url, str) and code_url:
+                return urljoin(APP_ENTRY_URL, code_url)
+
+    raise ResponseFormatError("Course module metadata lacks the semester code list")
+
+
+def parse_semester_list(payload: Any) -> dict[str, str]:
+    try:
+        rows = payload["datas"]["code"]["rows"]
+    except (KeyError, TypeError) as exc:
+        raise ResponseFormatError(
+            "Semester code response lacks datas.code.rows"
+        ) from exc
+
+    if not isinstance(rows, list):
+        raise ResponseFormatError("Semester code rows is not a list")
+
+    semesters: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ResponseFormatError("Semester code row is not an object")
+        code = row.get("id")
+        name = row.get("name")
+        if not isinstance(code, str) or not SEMESTER_PATTERN.fullmatch(code):
+            raise ResponseFormatError(f"Invalid semester code in code list: {code!r}")
+        if not isinstance(name, str) or not name:
+            raise ResponseFormatError(f"Semester {code} lacks a display name")
+        if code in semesters:
+            raise ResponseFormatError(f"Duplicate semester code in code list: {code}")
+        semesters[code] = name
+
+    if not semesters:
+        raise ResponseFormatError("Semester code list is empty")
+    return semesters
 
 
 def parse_course_response(
@@ -269,6 +312,7 @@ class NJUCourseClient:
         self.session = session or requests.Session()
         self.debug = os.getenv("NJU_DEBUG") == "1"
         self._last_request_at: float | None = None
+        self.semester_names: dict[str, str] = {}
 
         self.session.headers.update(
             {
@@ -382,6 +426,31 @@ class NJUCourseClient:
                 "Failed to initialize the NJU course application"
             ) from exc
 
+    def list_semesters(self) -> dict[str, str]:
+        try:
+            model_response = self.session.get(
+                COURSE_MODEL_URL,
+                timeout=self.timeout_seconds,
+            )
+            model_response.raise_for_status()
+            code_url = parse_semester_code_url(model_response.json())
+
+            code_response = self.session.get(
+                code_url,
+                timeout=self.timeout_seconds,
+            )
+            code_response.raise_for_status()
+            semesters = parse_semester_list(code_response.json())
+        except (requests.JSONDecodeError, ValueError) as exc:
+            raise ResponseFormatError(
+                "NJU semester discovery returned invalid JSON"
+            ) from exc
+        except requests.RequestException as exc:
+            raise ScrapeError("Failed to fetch the NJU semester list") from exc
+
+        self.semester_names = semesters
+        return semesters
+
     def _wait_for_rate_limit(self) -> None:
         if self._last_request_at is None:
             return
@@ -393,7 +462,10 @@ class NJUCourseClient:
     def fetch_page(self, semester: str, page: int) -> PageData:
         body = {
             "CXYH": "true",
-            "querySetting": make_query_setting(semester),
+            "querySetting": make_query_setting(
+                semester,
+                self.semester_names.get(semester),
+            ),
             "*order": "+KKDWDM,+KCH,+KXH",
             "pageSize": str(PAGE_SIZE),
             "pageNumber": str(page),
@@ -546,21 +618,26 @@ def discover_nonempty_semesters(
             print(f"  found {len(page.rows)} rows on page 1", flush=True)
         else:
             print("  no rows", flush=True)
-    return discovered
+    return dict(sorted(discovered.items(), key=lambda item: semester_sort_key(item[0])))
 
 
-def parse_terms(value: str) -> tuple[int, ...]:
-    try:
-        terms = tuple(
-            sorted({int(item.strip()) for item in value.split(",") if item.strip()})
-        )
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(
-            "terms must be comma-separated integers"
-        ) from exc
-    if not terms or any(term < 1 for term in terms):
-        raise argparse.ArgumentTypeError("terms must contain positive integers")
-    return terms
+def discover_latest_nonempty_semesters(
+    client: NJUCourseClient,
+    semesters: Iterable[str],
+    count: int,
+) -> dict[str, PageData]:
+    discovered: dict[str, PageData] = {}
+    for semester in sorted(semesters, key=semester_sort_key, reverse=True):
+        print(f"Probing {semester}...", flush=True)
+        page = client.fetch_page(semester, 1)
+        if page.rows:
+            discovered[semester] = page
+            print(f"  found {len(page.rows)} rows on page 1", flush=True)
+            if len(discovered) == count:
+                break
+        else:
+            print("  no rows", flush=True)
+    return dict(sorted(discovered.items(), key=lambda item: semester_sort_key(item[0])))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -601,13 +678,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--end-year",
         type=int,
         default=None,
-        help="last academic start year to probe",
-    )
-    parser.add_argument(
-        "--terms",
-        type=parse_terms,
-        default=parse_terms(os.getenv("NJU_SEMESTER_TERMS", "1,2")),
-        help="comma-separated semester suffixes (default: 1,2)",
+        help="last academic start year to include from the official semester list",
     )
     parser.add_argument(
         "--delay",
@@ -627,7 +698,6 @@ def build_parser() -> argparse.ArgumentParser:
 def select_work(
     args: argparse.Namespace,
     client: NJUCourseClient,
-    today: date | None = None,
 ) -> dict[str, PageData | None]:
     if args.semesters:
         selected: dict[str, PageData | None] = {}
@@ -638,27 +708,31 @@ def select_work(
             sorted(selected.items(), key=lambda item: semester_sort_key(item[0]))
         )
 
-    academic_year = current_academic_start_year(today)
-    end_year = args.end_year if args.end_year is not None else academic_year + 1
+    semesters = client.list_semesters()
+    candidates = [
+        semester
+        for semester in semesters
+        if semester_sort_key(semester)[0] >= args.start_year
+        and (args.end_year is None or semester_sort_key(semester)[0] <= args.end_year)
+    ]
+    if not candidates:
+        raise ScrapeError(
+            "The official semester list has no semesters in the requested range"
+        )
 
     if args.all:
-        candidates = candidate_semesters(args.start_year, end_year, args.terms)
         return discover_nonempty_semesters(client, candidates)
 
     if args.latest is None or args.latest < 1:
         raise ScrapeError("--latest must be at least 1")
 
-    # A small rolling window avoids probing every historical semester each day.
-    start_year = max(args.start_year, academic_year - 2)
-    candidates = candidate_semesters(start_year, end_year, args.terms)
-    discovered = discover_nonempty_semesters(client, candidates)
-    ordered = sorted(discovered, key=semester_sort_key)
-    if len(ordered) < args.latest:
+    discovered = discover_latest_nonempty_semesters(client, candidates, args.latest)
+    if len(discovered) < args.latest:
         raise ScrapeError(
-            f"Only found {len(ordered)} non-empty semesters; "
+            f"Only found {len(discovered)} non-empty semesters; "
             f"cannot select the latest {args.latest}"
         )
-    return {semester: discovered[semester] for semester in ordered[-args.latest :]}
+    return discovered
 
 
 def run(args: argparse.Namespace) -> list[SemesterResult]:
