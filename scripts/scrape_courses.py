@@ -22,11 +22,22 @@ from zoneinfo import ZoneInfo
 import requests
 
 APP_ENTRY_URL = "https://ehallapp.nju.edu.cn/jwapp/sys/kcbcx/*default/index.do"
+APP_CONFIG_URL_TEMPLATE = (
+    "https://ehallapp.nju.edu.cn/jwapp/sys/funauthapp/api/getAppConfig/"
+    "{appname}-{appid}.do"
+)
+SET_COMMON_ROLE_URL = (
+    "https://ehallapp.nju.edu.cn/jwapp/sys/jwpubapp/pub/setJwCommonAppRole.do"
+)
 COURSE_API_URL = "https://ehallapp.nju.edu.cn/jwapp/sys/kcbcx/modules/qxkcb/qxfbkccx.do"
 PAGE_SIZE = 500
 DEFAULT_START_YEAR = 2000
 DEFAULT_TERMS = (1, 2)
 SEMESTER_PATTERN = re.compile(r"^(\d{4})-(\d{4})-(\d+)$")
+INIT_CONFIG_PATTERN = re.compile(
+    r"window\._JW_INIT_CONFIG\s*=\s*(\{.*?\});",
+    re.DOTALL,
+)
 
 
 class ScrapeError(RuntimeError):
@@ -152,6 +163,29 @@ def make_query_setting(semester: str) -> str:
         },
     ]
     return json.dumps(setting, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_init_config(html: str) -> tuple[str, str, str]:
+    match = INIT_CONFIG_PATTERN.search(html)
+    if not match:
+        raise ResponseFormatError("Course application page lacks _JW_INIT_CONFIG")
+
+    try:
+        config = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise ResponseFormatError(
+            "Course application has invalid _JW_INIT_CONFIG"
+        ) from exc
+
+    appname = config.get("appname")
+    appid = config.get("appId")
+    role = config.get("ROLEID")
+    if not isinstance(appname, str) or not appname:
+        raise ResponseFormatError("Course application config lacks appname")
+    if not isinstance(appid, (str, int)) or not str(appid):
+        raise ResponseFormatError("Course application config lacks appId")
+
+    return appname, str(appid), "" if role is None else str(role)
 
 
 def parse_course_response(
@@ -302,6 +336,51 @@ class NJUCourseClient:
             or "/authserver/login" in final_url
         ):
             raise AuthenticationError("NJU_CASTGC is invalid or expired")
+
+        appname, appid, role = parse_init_config(response.text)
+        app_config_url = APP_CONFIG_URL_TEMPLATE.format(
+            appname=appname,
+            appid=appid,
+        )
+        try:
+            app_config_response = self.session.get(
+                app_config_url,
+                timeout=self.timeout_seconds,
+            )
+            app_config_response.raise_for_status()
+            app_config = app_config_response.json()
+            if not isinstance(app_config, dict):
+                raise ResponseFormatError(
+                    "Course application authorization config is not an object"
+                )
+            modules = app_config.get("MODULES")
+            if not isinstance(modules, list) or not modules:
+                raise AuthenticationError(
+                    "NJU account is not authorized for the course application"
+                )
+
+            role_response = self.session.post(
+                SET_COMMON_ROLE_URL,
+                data={"ROLEID": role},
+                timeout=self.timeout_seconds,
+            )
+            role_response.raise_for_status()
+            role_result = role_response.json()
+            if (
+                not isinstance(role_result, dict)
+                or str(role_result.get("success")) != "1"
+            ):
+                raise AuthenticationError(
+                    "NJU course application role initialization failed"
+                )
+        except (requests.JSONDecodeError, ValueError) as exc:
+            raise ResponseFormatError(
+                "NJU course application initialization returned invalid JSON"
+            ) from exc
+        except requests.RequestException as exc:
+            raise ScrapeError(
+                "Failed to initialize the NJU course application"
+            ) from exc
 
     def _wait_for_rate_limit(self) -> None:
         if self._last_request_at is None:

@@ -72,7 +72,6 @@ jobs:
       - name: Scrape course data
         env:
           NJU_CASTGC: ${{ secrets.NJU_CASTGC }}
-          NJU_DEBUG: "1"
         run: python scripts/scrape_courses.py ${{ steps.scope.outputs.args }}
 
       - name: Commit changed data

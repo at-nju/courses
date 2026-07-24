@@ -9,13 +9,18 @@ import pytest
 import requests
 
 from scripts.scrape_courses import (
+    APP_CONFIG_URL_TEMPLATE,
+    APP_ENTRY_URL,
+    SET_COMMON_ROLE_URL,
     AuthenticationError,
+    NJUCourseClient,
     PageData,
     ResponseFormatError,
     candidate_semesters,
     extract_castgc,
     make_query_setting,
     parse_course_response,
+    parse_init_config,
     scrape_semester,
     select_work,
     semester_display,
@@ -65,6 +70,52 @@ def test_query_setting_contains_requested_semester() -> None:
     payload = json.loads(make_query_setting("2026-2027-1"))
     assert payload[0]["value"] == "2026-2027-1"
     assert payload[0]["value_display"] == "2026-2027学年 第1学期"
+
+
+def test_parse_init_config_extracts_app_and_role() -> None:
+    html = (
+        "<script>window._JW_INIT_CONFIG = "
+        '{"appname":"kcbcx","appId":"123","ROLEID":null};</script>'
+    )
+    assert parse_init_config(html) == ("kcbcx", "123", "")
+
+
+def test_authenticate_initializes_app_permissions() -> None:
+    session = requests.Session()
+    entry = response_with(
+        (
+            b"<script>window._JW_INIT_CONFIG = "
+            b'{"appname":"kcbcx","appId":"123","ROLEID":null};</script>'
+        ),
+        url=APP_ENTRY_URL,
+    )
+    app_config = response_with(
+        b'{"MODULES":[{"route":"qxkcb"}]}',
+        url=APP_CONFIG_URL_TEMPLATE.format(appname="kcbcx", appid="123"),
+    )
+    role = response_with(b'{"success":"1"}', url=SET_COMMON_ROLE_URL)
+    get_calls: list[str] = []
+    post_calls: list[tuple[str, dict[str, str]]] = []
+
+    def fake_get(url: str, **_: object) -> requests.Response:
+        get_calls.append(url)
+        return entry if url == APP_ENTRY_URL else app_config
+
+    def fake_post(url: str, data: dict[str, str], **_: object) -> requests.Response:
+        post_calls.append((url, data))
+        return role
+
+    session.get = fake_get  # type: ignore[method-assign]
+    session.post = fake_post  # type: ignore[method-assign]
+
+    client = NJUCourseClient("ticket-value", session=session)
+    client.authenticate()
+
+    assert get_calls == [
+        APP_ENTRY_URL,
+        APP_CONFIG_URL_TEMPLATE.format(appname="kcbcx", appid="123"),
+    ]
+    assert post_calls == [(SET_COMMON_ROLE_URL, {"ROLEID": ""})]
 
 
 def test_parse_course_response_preserves_raw_bytes() -> None:
