@@ -210,6 +210,23 @@ def test_scrape_semester_reports_unchanged_directory(tmp_path: Path) -> None:
     assert (destination / "page_001.json").read_bytes() == raw
 
 
+def test_scrape_semester_preserves_empty_first_page(tmp_path: Path) -> None:
+    semester = "2020-2021-3"
+    raw = b'{"datas":{"qxfbkccx":{"rows":[]}}}'
+
+    result = scrape_semester(
+        FakeClient({}),
+        tmp_path,
+        semester,
+        PageData(raw=raw, rows=[]),
+    )
+
+    assert result.pages == 1
+    assert result.rows == 0
+    assert result.changed is True
+    assert (tmp_path / semester / "page_001.json").read_bytes() == raw
+
+
 def test_scrape_semester_fetches_until_short_page(tmp_path: Path) -> None:
     semester = "2026-2027-1"
     first = PageData(raw=b"first", rows=[{}] * 500)
@@ -258,8 +275,9 @@ def test_select_all_uses_authoritative_semester_list_including_summer() -> None:
         "2025-2026-1": "2025-2026学年 第1学期",
     }
     pages = {
-        (semester, 1): PageData(raw=semester.encode(), rows=[{"XNXQDM": semester}])
-        for semester in semesters
+        ("2025-2026-1", 1): PageData(raw=b"first", rows=[{"XNXQDM": "2025-2026-1"}]),
+        ("2025-2026-2", 1): PageData(raw=b"second", rows=[{"XNXQDM": "2025-2026-2"}]),
+        ("2025-2026-3", 1): PageData(raw=b"summer-empty", rows=[]),
     }
     client = FakeClient(pages, semesters)
     args = argparse.Namespace(

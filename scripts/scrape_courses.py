@@ -581,7 +581,8 @@ def scrape_semester(
 
             if not page_data.rows:
                 if page_number == 1:
-                    raise ScrapeError(f"Semester {semester} returned no course rows")
+                    (staging / "page_001.json").write_bytes(page_data.raw)
+                    page_count = 1
                 break
 
             (staging / f"page_{page_number:03d}.json").write_bytes(page_data.raw)
@@ -605,7 +606,7 @@ def scrape_semester(
         raise
 
 
-def discover_nonempty_semesters(
+def discover_semesters(
     client: NJUCourseClient,
     semesters: Iterable[str],
 ) -> dict[str, PageData]:
@@ -613,11 +614,11 @@ def discover_nonempty_semesters(
     for semester in semesters:
         print(f"Probing {semester}...", flush=True)
         page = client.fetch_page(semester, 1)
+        discovered[semester] = page
         if page.rows:
-            discovered[semester] = page
             print(f"  found {len(page.rows)} rows on page 1", flush=True)
         else:
-            print("  no rows", flush=True)
+            print("  no rows; preserving the empty raw page", flush=True)
     return dict(sorted(discovered.items(), key=lambda item: semester_sort_key(item[0])))
 
 
@@ -721,7 +722,7 @@ def select_work(
         )
 
     if args.all:
-        return discover_nonempty_semesters(client, candidates)
+        return discover_semesters(client, candidates)
 
     if args.latest is None or args.latest < 1:
         raise ScrapeError("--latest must be at least 1")
